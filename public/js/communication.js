@@ -43,7 +43,7 @@ $(function () {
 
     let position_dragging = false;
 
-    const IDLE_TIMEOUT_MS = (typeof idleTimeoutHours !== 'undefined' ? idleTimeoutHours : 3) * 60 * 60 * 1000;
+    const IDLE_TIMEOUT_MS = (typeof idleTimeoutHours !== 'undefined' ? idleTimeoutHours : 6) * 60 * 60 * 1000;
     let idleTimer = null;
     let idleDisconnected = false;
 
