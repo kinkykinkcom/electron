@@ -24,6 +24,7 @@ class CoyoteDevice {
 
         // Send loop
         this.sendInterval = null;
+        this.sending = false;  // Guard against overlapping BLE writes
 
         // Soft ramp state
         this.ramping = false;
@@ -278,12 +279,19 @@ class CoyoteDevice {
     }
 
     // Main send loop - runs every 100ms
+    // If the previous BLE write is still in flight, skip this tick rather than
+    // queuing stale values behind it.  This prevents the GATT write queue from
+    // growing unbounded and causing multi-second latency on V2 devices (which
+    // need 3 sequential characteristic writes per cycle).
     sendLoop() {
-        if (!this.connected) return;
+        if (!this.connected || this.sending) return;
 
         // If e-stopped, just keep sending zero
         if (this.eStopped) {
-            this.sendZero();
+            this.sending = true;
+            this.sendZero()
+                .catch(e => console.error('Coyote e-stop send error:', e))
+                .finally(() => { this.sending = false; });
             return;
         }
 
@@ -355,17 +363,19 @@ class CoyoteDevice {
         this.currentIntensityA = targetA;
         this.currentIntensityB = targetB;
 
-        // Send to device
-        try {
-            if (this.version === 'v2') {
-                this.sendV2Commands(this.currentIntensityA, this.currentIntensityB, periodA, periodB);
-            } else {
-                this.sendV3Command(this.currentIntensityA, this.currentIntensityB, periodA, periodB);
-            }
-        } catch (e) {
-            console.error('Coyote send error:', e);
-            if (this.onError) this.onError(e);
-        }
+        // Send to device - guard with this.sending so the next tick skips
+        // if BLE hasn't finished draining these writes yet
+        this.sending = true;
+        const sendPromise = this.version === 'v2'
+            ? this.sendV2Commands(this.currentIntensityA, this.currentIntensityB, periodA, periodB)
+            : this.sendV3Command(this.currentIntensityA, this.currentIntensityB, periodA, periodB);
+
+        sendPromise
+            .catch(e => {
+                console.error('Coyote send error:', e);
+                if (this.onError) this.onError(e);
+            })
+            .finally(() => { this.sending = false; });
     }
 
     // Send V2 commands
