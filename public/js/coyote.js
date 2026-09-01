@@ -24,12 +24,7 @@ class CoyoteDevice {
 
         // Send loop
         this.sendInterval = null;
-
-        // V2 last-sent intensity for change detection - only write intensity
-        // to the device when it actually changes, reducing steady-state BLE
-        // writes from 30/sec to ~20/sec to stay under the link's drain rate
-        this.lastSentIntensityA = -1;
-        this.lastSentIntensityB = -1;
+        this.sending = false;  // Guard against overlapping BLE writes
 
         // Soft ramp state
         this.ramping = false;
@@ -219,8 +214,6 @@ class CoyoteDevice {
         this.ramping = false;
         this.currentIntensityA = 0;
         this.currentIntensityB = 0;
-        this.lastSentIntensityA = -1;
-        this.lastSentIntensityB = -1;
         this.settings.maxIntensityA = 0;
         this.settings.maxIntensityB = 0;
         this.saveSettings();
@@ -234,9 +227,6 @@ class CoyoteDevice {
         this.ramping = false;
         this.currentIntensityA = 0;
         this.currentIntensityB = 0;
-        // Force intensity write-through on next send
-        this.lastSentIntensityA = -1;
-        this.lastSentIntensityB = -1;
 
         if (this.connected) {
             try {
@@ -288,29 +278,20 @@ class CoyoteDevice {
         }
     }
 
-    // Main send loop - runs every 100ms.
-    //
-    // V2 timing constraint: per the DG-LAB spec, each waveform write is only
-    // valid for 0.1s before the device stops output.  We MUST write waveform
-    // data every 100ms to keep the signal continuous.
-    //
-    // V2 latency constraint: Chrome serializes all GATT operations into one
-    // per-device queue, and writeValueWithoutResponse resolves when the data
-    // is queued to the OS Bluetooth stack, not when it's transmitted.  Writing
-    // 3 characteristics per tick (30 writes/sec) can exceed the BLE link's
-    // drain rate, causing stale writes to accumulate in the OS queue.
-    //
-    // Fix: intensity (PWM_AB2) persists on the device, so we only write it
-    // when the value actually changes.  Waveforms must go out every tick
-    // regardless.  This drops steady-state from 30 writes/sec to 20 writes/sec,
-    // keeping us under the BLE drain rate (~25-30/sec at typical connection
-    // intervals) so the queue stays near-empty and values stay current.
+    // Main send loop - runs every 100ms
+    // If the previous BLE write is still in flight, skip this tick rather than
+    // queuing stale values behind it.  This prevents the GATT write queue from
+    // growing unbounded and causing multi-second latency on V2 devices (which
+    // need 3 sequential characteristic writes per cycle).
     sendLoop() {
-        if (!this.connected) return;
+        if (!this.connected || this.sending) return;
 
         // If e-stopped, just keep sending zero
         if (this.eStopped) {
-            this.sendZero();
+            this.sending = true;
+            this.sendZero()
+                .catch(e => console.error('Coyote e-stop send error:', e))
+                .finally(() => { this.sending = false; });
             return;
         }
 
@@ -382,41 +363,34 @@ class CoyoteDevice {
         this.currentIntensityA = targetA;
         this.currentIntensityB = targetB;
 
-        // Send to device
-        try {
-            if (this.version === 'v2') {
-                this.sendV2Commands(this.currentIntensityA, this.currentIntensityB, periodA, periodB);
-            } else {
-                this.sendV3Command(this.currentIntensityA, this.currentIntensityB, periodA, periodB);
-            }
-        } catch (e) {
-            console.error('Coyote send error:', e);
-            if (this.onError) this.onError(e);
-        }
+        // Send to device - guard with this.sending so the next tick skips
+        // if BLE hasn't finished draining these writes yet
+        this.sending = true;
+        const sendPromise = this.version === 'v2'
+            ? this.sendV2Commands(this.currentIntensityA, this.currentIntensityB, periodA, periodB)
+            : this.sendV3Command(this.currentIntensityA, this.currentIntensityB, periodA, periodB);
+
+        sendPromise
+            .catch(e => {
+                console.error('Coyote send error:', e);
+                if (this.onError) this.onError(e);
+            })
+            .finally(() => { this.sending = false; });
     }
 
-    // Send V2 commands.  Waveform writes go out every tick (device stops
-    // output after 100ms without new data).  Intensity only writes when
-    // changed, since it persists on the device.  This keeps steady-state
-    // at 2 BLE writes per tick (20/sec) instead of 3 (30/sec), staying
-    // under the link's drain rate so the OS queue doesn't grow.
+    // Send V2 commands
     async sendV2Commands(intensityA, intensityB, periodA, periodB) {
         if (!this.charIntensity || !this.charWaveA || !this.charWaveB) return;
 
+        const intensityBytes = this.v2Protocol.encodeIntensity(intensityA, intensityB);
         const waveABytes = this.v2Protocol.getWaveformBytes(periodA);
         const waveBBytes = this.v2Protocol.getWaveformBytes(periodB);
 
-        // Intensity persists on device - only write when value changes
-        if (intensityA !== this.lastSentIntensityA || intensityB !== this.lastSentIntensityB) {
-            const intensityBytes = this.v2Protocol.encodeIntensity(intensityA, intensityB);
-            this.charIntensity.writeValueWithoutResponse(intensityBytes);
-            this.lastSentIntensityA = intensityA;
-            this.lastSentIntensityB = intensityB;
-        }
-
-        // Waveforms expire after 100ms - must write every tick
-        this.charWaveA.writeValueWithoutResponse(waveABytes);
-        this.charWaveB.writeValueWithoutResponse(waveBBytes);
+        // Write all three characteristics
+        // Note: Writing in parallel can cause issues, so we sequence them
+        await this.charIntensity.writeValueWithoutResponse(intensityBytes);
+        await this.charWaveA.writeValueWithoutResponse(waveABytes);
+        await this.charWaveB.writeValueWithoutResponse(waveBBytes);
     }
 
     // Send V3 command
